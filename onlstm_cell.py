@@ -249,31 +249,3 @@ if __name__ == '__main__':
     a = ON_LSTMCell(128)
     print(a)
 
-"""
-inputs = tf.placeholder(tf.float32, shape=[5, 128])
-_h = tf.placeholder(tf.float32, shape=[5, 128])
-_c = tf.placeholder(tf.float32, shape=[5, 128])
-levels = 10
-w = vs.get_variable("w", shape=[256, 4*128+2*10])
-_bias = vs.get_variable('b', shape=[4*128+2*10])
-concat = math_ops.matmul(array_ops.concat([inputs, _h], 1), w)
-concat = nn_ops.bias_add(concat, _bias)
-
-f_master_gate = _cumsoftmax(concat[:, :levels], 'l2r')
-f_master_gate = array_ops.expand_dims(f_master_gate, 2)
-i_master_gate = _cumsoftmax(concat[:, levels: levels * 2], 'r2l')
-i_master_gate = array_ops.expand_dims(i_master_gate, 2)
-
-if __name__ == '__main__':
-    input = np.random.rand(5, 128)
-    h = np.random.rand(5, 128)
-    c = np.random.rand(5, 128)
-
-    feed_dict = {inputs: input, _h: h, _c: c}
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-
-        f, i = sess.run([f_master_gate, i_master_gate], feed_dict=feed_dict)
-
-        print(len(f))
-"""
