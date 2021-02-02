@@ -1,6 +1,6 @@
 """
 created on 20190621
-@author: lili
+@author: whull
 function: ON_LSTMcell
 """
 
@@ -22,25 +22,26 @@ from tensorflow.python.ops import gen_array_ops
 _BIAS_VARIABLE_NAME = "bias"
 _WEIGHTS_VARIABLE_NAME = "kernel"
 
+
 def _cumsoftmax(x, mode='l2r'):
     """先softmax，然后cumsum，
     cumsum区分从左到右、从右到左两种模式
     """
-    axis = len(x.shape.as_list()) - 1
+    # axis = len(x.shape.as_list()) - 1
+    axis = -1
+    x = tf.nn.softmax(x, axis=axis)
     if mode == 'l2r':
-        x = tf.nn.softmax(x, axis=axis)
         x = tf.cumsum(x, axis=axis)
-        return x
     elif mode == 'r2l':
-        x = x[..., ::-1]
-        x = tf.nn.softmax(x, axis=axis)
-        x = tf.cumsum(x, axis=axis)
-        return x[..., ::-1]
+        x = tf.cumsum(x, axis=axis, reverse=True)
     else:
-        return x
+        raise ValueError("mode must be l2r or r2l")
+
+    return x
 
 
 _LSTMStateTuple = collections.namedtuple("LSTMStateTuple", ("c", "h"))
+
 
 class LSTMStateTuple(_LSTMStateTuple):
   """Tuple used by LSTM Cells for `state_size`, `zero_state`, and output state.
@@ -181,7 +182,7 @@ class ON_LSTMCell(_LayerRNNCell):
 
     self.built = True
 
-  def call(self, inputs, state):
+  def call_p(self, inputs, state):
     """Long short-term memory cell (LSTM).
 
     Args:
@@ -209,10 +210,9 @@ class ON_LSTMCell(_LayerRNNCell):
     gate_inputs = nn_ops.bias_add(gate_inputs, self._bias)
 
     f_master_gate = _cumsoftmax(gate_inputs[:, :self._levels], 'l2r')
-    f_master_gate = array_ops.expand_dims(f_master_gate, 2)
+    f_master_gate = array_ops.expand_dims(f_master_gate, 2)  # shape=(batch_size, levels, 1)
     i_master_gate = _cumsoftmax(gate_inputs[:, self._levels: self._levels * 2], 'r2l')
-    i_master_gate = array_ops.expand_dims(i_master_gate, 2)
-
+    i_master_gate = array_ops.expand_dims(i_master_gate, 2)  # shape=(batch_size, levels, 1)
 
     gate_inputs = gen_array_ops.reshape(gate_inputs[:, self._levels * 2:], [-1, self._levels * 4, self._chunk_size])
 
@@ -224,15 +224,22 @@ class ON_LSTMCell(_LayerRNNCell):
     # Note that using `add` and `multiply` instead of `+` and `*` gives a
     # performance improvement. So using those at the cost of readability.
 
-    overlap = f_master_gate * i_master_gate
-    c = gen_array_ops.reshape(c, [-1, self._levels, self._chunk_size])
     add = math_ops.add
     multiply = math_ops.multiply
+
+    c = gen_array_ops.reshape(c, [-1, self._levels, self._chunk_size])
     new_c = add(multiply(c, sigmoid(add(f, forget_bias_tensor))),
                 multiply(sigmoid(i), self._activation(j)))
 
-    new_c = (overlap * new_c + (f_master_gate - overlap) * c +
-             (i_master_gate - overlap) * self._activation(j))
+    # new_c = (overlap * new_c + (f_master_gate - overlap) * c +
+    #          (i_master_gate - overlap) * self._activation(j))
+    # overlap = f_master_gate * i_master_gate
+    overlap = multiply(f_master_gate, i_master_gate)  # shape=(batch_size, levels, 1)
+    new_c = add(
+        add(multiply(overlap, new_c),
+            multiply((f_master_gate - overlap), c)),
+        multiply((i_master_gate - overlap), self._activation(j)))
+
     new_h = multiply(self._activation(new_c), sigmoid(o))
 
     new_c = gen_array_ops.reshape(new_c, [-1, self._num_units])
@@ -244,8 +251,88 @@ class ON_LSTMCell(_LayerRNNCell):
       new_state = array_ops.concat([new_c, new_h], 1)
     return new_h, new_state
 
+  def call(self, inputs, state):
+    """Long short-term memory cell (LSTM).
+
+    Args:
+      inputs: `2-D` tensor with shape `[batch_size, input_size]`.
+      state: An `LSTMStateTuple` of state tensors, each shaped
+        `[batch_size, self.state_size]`, if `state_is_tuple` has been set to
+        `True`.  Otherwise, a `Tensor` shaped
+        `[batch_size, 2 * self.state_size]`.
+
+    Returns:
+      A pair containing the new hidden state, and the new state (either a
+        `LSTMStateTuple` or a concatenated state, depending on
+        `state_is_tuple`).
+    """
+    sigmoid = math_ops.sigmoid
+    one = constant_op.constant(1, dtype=dtypes.int32)
+    # Parameters of gates are concatenated into one multiply for efficiency.
+    if self._state_is_tuple:
+      c, h = state
+    else:
+      c, h = array_ops.split(value=state, num_or_size_splits=2, axis=one)
+
+    gate_inputs = math_ops.matmul(
+        array_ops.concat([inputs, h], 1), self._kernel)
+    gate_inputs = nn_ops.bias_add(gate_inputs, self._bias)
+
+    f_master_gate = _cumsoftmax(gate_inputs[:, :self._levels], 'l2r')  # shape=(batch_size, levels)
+    f_master_gate = tf.tile(f_master_gate, [1, self._chunk_size])  # shape=(batch_size, num_units)
+
+    i_master_gate = _cumsoftmax(gate_inputs[:, self._levels: self._levels * 2], 'r2l')
+    i_master_gate = tf.tile(i_master_gate, [1, self._chunk_size])
+
+    # 匹配之前实现方案
+    # f_master_gate = tf.transpose(tf.reshape(f_master_gate, [-1, self._chunk_size, self._levels]), [0, 2, 1])
+    # f_master_gate = tf.reshape(f_master_gate, [-1, self._num_units])
+    # i_master_gate = tf.transpose(tf.reshape(i_master_gate, [-1, self._chunk_size, self._levels]), [0, 2, 1])
+    # i_master_gate = tf.reshape(i_master_gate, [-1, self._num_units])
+
+    # i = input_gate, j = new_input, f = forget_gate, o = output_gate
+    i, j, f, o = array_ops.split(
+        value=gate_inputs[:, self._levels * 2:], num_or_size_splits=4, axis=one)
+
+    forget_bias_tensor = constant_op.constant(self._forget_bias, dtype=f.dtype)
+    # Note that using `add` and `multiply` instead of `+` and `*` gives a
+    # performance improvement. So using those at the cost of readability.
+
+    add = math_ops.add
+    multiply = math_ops.multiply
+
+    new_c = add(multiply(c, sigmoid(add(f, forget_bias_tensor))),
+                multiply(sigmoid(i), self._activation(j)))  # shape=(batch_size, num_units)
+
+    # new_c = (overlap * new_c + (f_master_gate - overlap) * c +
+    #          (i_master_gate - overlap) * self._activation(j))
+    # overlap = f_master_gate * i_master_gate
+    overlap = multiply(f_master_gate, i_master_gate)  # shape=(batch_size, num_units)
+    new_c = add(
+        add(multiply(overlap, new_c),
+            multiply((f_master_gate - overlap), c)),
+        multiply((i_master_gate - overlap), self._activation(j)))
+
+    new_h = multiply(self._activation(new_c), sigmoid(o))
+
+    if self._state_is_tuple:
+      new_state = LSTMStateTuple(new_c, new_h)
+    else:
+      new_state = array_ops.concat([new_c, new_h], 1)
+    return new_h, new_state
+
 
 if __name__ == '__main__':
-    a = ON_LSTMCell(128)
-    print(a)
+    # a = ON_LSTMCell(128, 4)
+    # print(a)
+    encoder_outputs = tf.constant([[[1, 3, 1], [2, 3, 2]], [[2, 3, 4], [2, 3, 2]]])
+    print(encoder_outputs.get_shape())  # (2, 2, 3)
+    # 将batch内的每个样本复制3次, tile_batch() 的第2个参数是一个 int 类型数据
+    encoder_outputs = tf.constant([[1, 2, 3, 4], [2, 3, 4, 5]])
+    z4 = tf.contrib.seq2seq.tile_batch(encoder_outputs, multiplier=2)
+    # z5 = tf.tile(encoder_outputs, [2, 1, 1])
+    with tf.Session() as sess:
+        print(sess.run(z4))
+        print('-'*3)
+        # print(sess.run(z5))
 
